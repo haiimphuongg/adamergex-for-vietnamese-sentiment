@@ -158,3 +158,7 @@ if __name__ == "__main__":
     # print("\nTo run processing:")
     # print("python data_processing.py --task_type clm --input_file raw_vietnamese_clm.txt --output_file ./processed_data/vietnamese_clm_train.json --max_samples 100")
     # print("python data_processing.py --task_type sentiment --input_file raw_english_sentiment.csv --output_file ./processed_data/english_sentiment_train.json")
+
+    # print("\nNote: Adjust the paths and filenames as needed.")
+    # print("You can also use the --max_samples argument to limit the number of samples processed.")
+    # print("Ensure you have the required libraries installed: tqdm, pandas.")
