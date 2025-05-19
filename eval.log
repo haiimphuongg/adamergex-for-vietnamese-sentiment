@@ -1,0 +1,30 @@
+nohup: ignoring input
+Loading base models (this might take a while and consume VRAM/RAM)...
+Loading tokenizer: meta-llama/Llama-3.2-3B-Instruct
+Loading base model: meta-llama/Llama-3.2-3B-Instruct
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00, 49.37it/s]
+Loading tokenizer: meta-llama/Llama-3.2-3B-Instruct
+Loading base model: meta-llama/Llama-3.2-3B-Instruct
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00, 49.89it/s]
+Loading tokenizer: meta-llama/Llama-3.2-3B-Instruct
+Loading base model: meta-llama/Llama-3.2-3B-Instruct
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00, 50.48it/s]
+Loading adapter for Target Task in Source Lang (l2_t1) from: /workspace/adamergex/adamergex-for-vietnamese-sentiment/trained_adapters/en_sentiment_adapter
+Loading adapter for Reference Task in Target Lang (l1_t2) from: /workspace/adamergex/adamergex-for-vietnamese-sentiment/trained_adapters/vi_clm_adapter
+Loading adapter for Reference Task in Source Lang (l2_t2) from: /workspace/adamergex/adamergex-for-vietnamese-sentiment/trained_adapters/en_clm_adapter
+Calculating language ability vector (modifies params for adapter l1_t2)...
+Calculating Language Delta:   0%|          | 0/392 [00:00<?, ?it/s]Calculating Language Delta: 100%|██████████| 392/392 [00:00<00:00, 35496.60it/s]
+Calculating final merged adapter weights (modifies params for adapter l2_t1)...
+Merging Adapters:   0%|          | 0/392 [00:00<?, ?it/s]Merging Adapters: 100%|██████████| 392/392 [00:00<00:00, 4356.33it/s]
+Updating PeftModel 'en_sentiment_adapter' with merged weights...
+Saving merged adapter to: ./merged_vietnamese_sentiment_adamergex
+Merged adapter (originally 'en_sentiment_adapter', now merged) saved.
+
+--- Performing Inference with Merged Adapter ---
+Loading tokenizer: meta-llama/Llama-3.2-3B-Instruct
+Loading base model: meta-llama/Llama-3.2-3B-Instruct
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:04<00:04,  4.07s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:05<00:00,  2.48s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:05<00:00,  2.72s/it]
+Loading merged adapter from: ./merged_vietnamese_sentiment_adamergex for inference.
+Could not load merged adapter with default name. Error: Can't find 'adapter_config.json' at './merged_vietnamese_sentiment_adamergex'
+Try specifying adapter_name='en_sentiment_adapter' if that's how it was saved.
+Failed to load adapter even with name en_sentiment_adapter. Error: Can't find 'adapter_config.json' at './merged_vietnamese_sentiment_adamergex'
