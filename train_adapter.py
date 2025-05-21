@@ -1,220 +1,256 @@
 import os
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, BitsAndBytesConfig
-from datasets import load_dataset, Dataset
-from trl import SFTTrainer, SFTConfig
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from datasets import load_from_disk, DatasetDict
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoModelForMaskedLM,
+    AutoTokenizer,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForLanguageModeling,
+    DataCollatorWithPadding,
+)
+from peft import LoraConfig, get_peft_model, TaskType
+from sklearn.metrics import accuracy_score, f1_score
+import numpy as np
 import argparse
-import json
+import logging
 
-# --- Default Configuration (can be overridden by args) ---
-BASE_MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
-TOKENIZER_NAME = "meta-llama/Llama-3.2-3B-Instruct"
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Configuration & Model Parameters ---
+MODEL_NAME_OR_PATH = "xlm-roberta-base"
+MAX_LENGTH = 128  # Max sequence length for tokenizer (consistent with dataset filtering)
 
 # LoRA Configuration
 LORA_R = 8
 LORA_ALPHA = 16
-LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-LORA_DROPOUT = 0.05
-LORA_BIAS = "none"
+LORA_DROPOUT = 0.1
+LORA_TARGET_MODULES_SENTIMENT = ["query", "value", "key", "dense"]  # For XLM-RoBERTa attention layers
+LORA_TARGET_MODULES_MLM = ["query", "value", "key", "dense"]  # For MLM, include dense layers
 
-# Training Arguments
-PER_DEVICE_TRAIN_BATCH_SIZE = 30
-GRADIENT_ACCUMULATION_STEPS = 4
-LEARNING_RATE = 2e-4
-NUM_TRAIN_EPOCHS = 3
-MAX_SEQ_LENGTH = 256
-OPTIM = "paged_adamw_32bit"
-LR_SCHEDULER_TYPE = "cosine"
-WARMUP_RATIO = 0.05
-MAX_GRAD_NORM = 0.3
-LOGGING_STEPS = 10
-SAVE_TOTAL_LIMIT = 1
+# Label mapping for sentiment (consistent with process_data.py)
+SENTIMENT_LABEL_MAP = {"negative": 0, "neutral": 1, "positive": 2}
+ID2LABEL_SENTIMENT = {v: k for k, v in SENTIMENT_LABEL_MAP.items()}
+LABEL2ID_SENTIMENT = SENTIMENT_LABEL_MAP
+NUM_LABELS_SENTIMENT = len(SENTIMENT_LABEL_MAP)
 
-OUTPUT_DIR_ROOT = "./trained_adapters"
+# --- Helper Functions ---
+def safe_create_dir(directory):
+    """Create directory if it doesn't exist."""
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+        logging.info(f"Created directory: {directory}")
 
-def print_trainable_parameters(model):
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    print(
-        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param:.2f}"
-    )
+def compute_metrics_sentiment(pred):
+    """Compute accuracy and F1 score for sentiment classification."""
+    labels = pred.label_ids
+    preds = np.argmax(pred.predictions, axis=1)
+    acc = accuracy_score(labels, preds)
+    f1 = f1_score(labels, preds, average="weighted")
+    return {"accuracy": acc, "f1": f1}
 
-def sentiment_formatting_func(example):
-    """Formatting function for sentiment analysis dataset."""
-    return f"{example['instruction']}\nInput: {example['input']}\nOutput: {example['output']}"
+# --- Main Training Function ---
+def train_adapter(task, data_path, output_dir_base):
+    """Trains a LoRA adapter for the specified task (mlm_en, mlm_vi, or sentiment_vi)."""
+    logging.info(f"Starting training for task: {task}")
+    safe_create_dir(output_dir_base)
 
-def clm_formatting_func(example):
-    """Formatting function for causal language modeling dataset."""
-    return f"{example['prompt']}{example['completion']}"
-
-def tokenize_function(example, tokenizer, formatting_func, max_seq_length):
-    """Tokenize and pad the formatted text to max_seq_length."""
-    formatted_text = formatting_func(example)
-    tokenized = tokenizer(
-        formatted_text,
-        padding="max_length",  # Pad to max_length
-        truncation=True,
-        max_length=max_seq_length,
-        return_tensors=None,  # Return as lists, not tensors
-    )
-    return {
-        "input_ids": tokenized["input_ids"],
-        "attention_mask": tokenized["attention_mask"],
-    }
-
-def main(args):
-    print(f"\n--- Starting LoRA Adapter Training for: {args.adapter_name} ---")
-    print(f"Task type: {args.task_type}")
-    print(f"Using base model: {args.base_model_name}")
-    print(f"Processed dataset path: {args.dataset_path}")
-    adapter_specific_output_dir = os.path.join(args.output_dir_root, args.adapter_name)
-    trainer_checkpoints_dir = os.path.join(adapter_specific_output_dir, "trainer_checkpoints")
-    print(f"Adapter will be saved to: {adapter_specific_output_dir}")
-    print(f"Trainer checkpoints: {trainer_checkpoints_dir}")
+    # Determine task type and language
+    if task == "mlm_en":
+        task_type = "mlm"
+        lang = "en"
+    elif task == "mlm_vi":
+        task_type = "mlm"
+        lang = "vi"
+    elif task == "sentiment_vi":
+        task_type = "sentiment"
+        lang = "vi"
+    elif task == 'sentiment_en':
+        task_type = "sentiment"
+        lang = "en"
+    else:
+        logging.error(f"Invalid task: {task}. Must be 'mlm_en', 'mlm_vi', 'sentiment_en' or 'sentiment_vi'.")
+        return
 
     # 1. Load Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME_OR_PATH)
+    except Exception as e:
+        logging.error(f"Error loading tokenizer: {e}")
+        return
 
     # 2. Load Processed Dataset
     try:
-        train_dataset = load_dataset("json", data_files=args.dataset_path, split="train")
+        if not os.path.exists(data_path):
+            logging.error(f"Processed dataset not found at {data_path}. Run process_data.py first.")
+            return
+        dataset = load_from_disk(data_path)
+        logging.info(f"Loaded dataset from {data_path}")
     except Exception as e:
-        print(f"Error loading dataset from {args.dataset_path}: {e}")
-        print("Ensure the JSON file is a list of dictionaries with appropriate fields.")
+        logging.error(f"Could not load dataset from {data_path}: {e}")
         return
 
-    print(f"Loaded dataset with {len(train_dataset)} samples for {args.adapter_name}.")
-    if len(train_dataset) == 0:
-        print("Error: Dataset is empty.")
-        return
+    # 3. Preprocess (Tokenize) Data
+    def tokenize_function_sentiment(examples):
+        return tokenizer(examples["text"], truncation=True, max_length=MAX_LENGTH, padding="max_length")
 
-    # 3. Select Formatting Function
-    if args.task_type == "sentiment":
-        formatting_func = sentiment_formatting_func
-    elif args.task_type == "clm":
-        formatting_func = clm_formatting_func
+    def tokenize_function_mlm(examples):
+        return tokenizer(examples["text"], truncation=True, max_length=MAX_LENGTH, padding="max_length")
+
+    if task_type == "sentiment":
+        tokenized_dataset = dataset.map(tokenize_function_sentiment, batched=True, remove_columns=["text"])
+    elif task_type == "mlm":
+        tokenized_dataset = dataset.map(tokenize_function_mlm, batched=True, remove_columns=["text"])
     else:
-        print(f"Error: Invalid task_type '{args.task_type}'. Must be 'sentiment' or 'clm'.")
+        logging.error(f"Unknown task_type: {task_type}")
         return
 
-    # 4. Tokenize Dataset with Padding
-    tokenized_dataset = train_dataset.map(
-        lambda x: tokenize_function(x, tokenizer, formatting_func, args.max_seq_length),
-        batched=False,
-        remove_columns=train_dataset.column_names,  # Remove original columns
+    # 4. Initialize Model, LoRA Config, and PEFT Model
+    if task_type == "sentiment":
+        try:
+            model = AutoModelForSequenceClassification.from_pretrained(
+                MODEL_NAME_OR_PATH,
+                num_labels=NUM_LABELS_SENTIMENT,
+                id2label=ID2LABEL_SENTIMENT,
+                label2id=LABEL2ID_SENTIMENT,
+                ignore_mismatched_sizes=True
+            )
+        except Exception as e:
+            logging.error(f"Error loading sentiment model: {e}")
+            return
+        peft_config = LoraConfig(
+            task_type=TaskType.SEQ_CLS,
+            r=LORA_R,
+            lora_alpha=LORA_ALPHA,
+            lora_dropout=LORA_DROPOUT,
+            target_modules=LORA_TARGET_MODULES_SENTIMENT,
+            bias="none",
+            modules_to_save=["classifier"]
+        )
+    elif task_type == "mlm":
+        try:
+            model = AutoModelForMaskedLM.from_pretrained(MODEL_NAME_OR_PATH)
+        except Exception as e:
+            logging.error(f"Error loading MLM model: {e}")
+            return
+        peft_config = LoraConfig(
+            r=LORA_R,
+            lora_alpha=LORA_ALPHA,
+            lora_dropout=LORA_DROPOUT,
+            target_modules=LORA_TARGET_MODULES_MLM,
+            bias="none"
+        )
+
+    try:
+        peft_model = get_peft_model(model, peft_config)
+        peft_model.print_trainable_parameters()
+    except Exception as e:
+        logging.error(f"Error creating PEFT model: {e}")
+        return
+
+    # 5. Data Collator
+    if task_type == "sentiment":
+        data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    elif task_type == "mlm":
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=True, mlm_probability=0.15)
+
+    # 6. Training Arguments
+    adapter_name = f"{lang}_{task_type}_xlmr_lora"
+    training_output_dir = os.path.join(output_dir_base, adapter_name, "training_checkpoints")
+    final_adapter_save_path = os.path.join(output_dir_base, adapter_name)
+
+    # Optimize for 8GB RAM
+    training_args = TrainingArguments(
+        output_dir=training_output_dir,
+        num_train_epochs=3,  # 1 epoch for MLM due to large dataset
+        per_device_train_batch_size=32,
+        per_device_eval_batch_size=32,
+        warmup_steps=500,
+        weight_decay=0.01,
+        logging_dir=os.path.join(output_dir_base, adapter_name, "logs"),
+        logging_steps=100,
+        eval_strategy="epoch" if "validation" in tokenized_dataset else "no",
+        save_strategy="epoch" if "validation" in tokenized_dataset else "no",
+        load_best_model_at_end="validation" in tokenized_dataset and task_type == "sentiment",  # Only for sentiment
+        metric_for_best_model="f1" if task_type == "sentiment" and "validation" in tokenized_dataset else None,
+        save_total_limit=1,
+        fp16=False,  # Disable mixed precision for CPU/low-VRAM GPU
+        report_to="none"
     )
 
-    # 5. Load Base Model with Quantization
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
-    base_model = AutoModelForCausalLM.from_pretrained(
-        args.base_model_name,
-        quantization_config=bnb_config,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True
-    )
-    base_model.config.use_cache = False
-    base_model = prepare_model_for_kbit_training(base_model, use_gradient_checkpointing=True)
+    # 7. Trainer
+    try:
+        trainer = Trainer(
+            model=peft_model,
+            args=training_args,
+            train_dataset=tokenized_dataset["train"],
+            eval_dataset=tokenized_dataset["validation"] if "validation" in tokenized_dataset else None,
+            processing_class=tokenizer,
+            data_collator=data_collator,
+            compute_metrics=compute_metrics_sentiment if task_type == "sentiment" else None,
+        )
+    except Exception as e:
+        logging.error(f"Error creating Trainer: {e}")
+        return
 
-    # 6. PEFT Configuration
-    peft_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=args.lora_target_modules,
-        lora_dropout=args.lora_dropout,
-        bias=args.lora_bias,
-        task_type="CAUSAL_LM",
-    )
-    model_with_lora = get_peft_model(base_model, peft_config)
-    print_trainable_parameters(model_with_lora)
-
-    # 7. Training Arguments
-    training_args = SFTConfig(
-        output_dir=trainer_checkpoints_dir,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation,
-        gradient_checkpointing=True,
-        max_grad_norm=args.max_grad_norm,
-        num_train_epochs=args.epochs,
-        learning_rate=args.learning_rate,
-        bf16=True,
-        save_strategy="epoch",
-        save_total_limit=args.save_total_limit,
-        logging_steps=args.logging_steps,
-        optim=args.optim,
-        lr_scheduler_type=args.lr_scheduler_type,
-        warmup_ratio=args.warmup_ratio,
-        report_to="tensorboard",
-        run_name=f"{args.adapter_name}_training_run",
-        remove_unused_columns=False,  # Keep tokenized columns
-        max_seq_length=args.max_seq_length,
-    )
-
-    # 8. Initialize SFTTrainer
-    trainer = SFTTrainer(
-        model=model_with_lora,
-        train_dataset=tokenized_dataset,
-        args=training_args,
-        peft_config=peft_config,
-        processing_class=tokenizer,
-    )
-
-    # 9. Train
-    print(f"Starting SFTTrainer training for {args.adapter_name}...")
+    # 8. Train
+    logging.info(f"Starting training for {adapter_name}...")
     trainer.train()
-    print("Training finished.")
+    #     logging.info(f"Training finished for {adapter_name}.")
+    # except Exception as e:
+    #     logging.error(f"Training failed for {adapter_name}: {e}")
+    #     return
 
-    # 10. Save Final Adapter
-    os.makedirs(adapter_specific_output_dir, exist_ok=True)
-    print(f"Saving final adapter to: {adapter_specific_output_dir}")
-    trainer.model.save_pretrained(adapter_specific_output_dir)
-    tokenizer.save_pretrained(adapter_specific_output_dir)
-    print(f"Adapter {args.adapter_name} saved successfully.")
-
-    # Clean up
-    del model_with_lora
-    del base_model
-    del trainer
-    torch.cuda.empty_cache()
-    print(f"--- Finished training and saved: {args.adapter_name} ---\n")
+    # 9. Save Adapter
+    try:
+        safe_create_dir(final_adapter_save_path)
+        peft_model.save_pretrained(final_adapter_save_path)
+        tokenizer.save_pretrained(final_adapter_save_path)
+        logging.info(f"Adapter saved to {final_adapter_save_path}")
+    except Exception as e:
+        logging.error(f"Error saving adapter to {final_adapter_save_path}: {e}")
 
 if __name__ == "__main__":
-    print("I am here to train LoRA adapters for Llama 3 models.")
-    parser = argparse.ArgumentParser(description="Train a LoRA adapter.")
-    parser.add_argument("--adapter_name", required=True, help="Name for the adapter (e.g., en_sentiment, vi_clm). This will be the subdir name.")
-    parser.add_argument("--dataset_path", required=True, help="Path to the processed JSON dataset file.")
-    parser.add_argument("--task_type", required=True, choices=["clm", "sentiment"], help="Task type: 'clm' for causal LM or 'sentiment' for sentiment analysis.")
-    parser.add_argument("--base_model_name", type=str, default=BASE_MODEL_NAME)
-    parser.add_argument("--tokenizer_name", type=str, default=TOKENIZER_NAME)
-    parser.add_argument("--lora_r", type=int, default=LORA_R)
-    parser.add_argument("--lora_alpha", type=int, default=LORA_ALPHA)
-    parser.add_argument("--lora_dropout", type=float, default=LORA_DROPOUT)
-    parser.add_argument("--lora_bias", type=str, default=LORA_BIAS)
-    parser.add_argument("--lora_target_modules", nargs='+', default=LORA_TARGET_MODULES)
-    parser.add_argument("--batch_size", type=int, default=PER_DEVICE_TRAIN_BATCH_SIZE)
-    parser.add_argument("--gradient_accumulation", type=int, default=GRADIENT_ACCUMULATION_STEPS)
-    parser.add_argument("--epochs", type=int, default=NUM_TRAIN_EPOCHS)
-    parser.add_argument("--learning_rate", type=float, default=LEARNING_RATE)
-    parser.add_argument("--max_seq_length", type=int, default=MAX_SEQ_LENGTH)
-    parser.add_argument("--optim", type=str, default=OPTIM)
-    parser.add_argument("--lr_scheduler_type", type=str, default=LR_SCHEDULER_TYPE)
-    parser.add_argument("--warmup_ratio", type=float, default=WARMUP_RATIO)
-    parser.add_argument("--max_grad_norm", type=float, default=MAX_GRAD_NORM)
-    parser.add_argument("--logging_steps", type=int, default=LOGGING_STEPS)
-    parser.add_argument("--save_total_limit", type=int, default=SAVE_TOTAL_LIMIT)
-    parser.add_argument("--output_dir_root", type=str, default=OUTPUT_DIR_ROOT)
+    parser = argparse.ArgumentParser(description="Train LoRA adapters for MLM (English/Vietnamese) or Sentiment (Vietnamese).")
+    parser.add_argument(
+        "--task",
+        type=str,
+        required=True,
+        choices=["mlm_en", "mlm_vi", "sentiment_vi", "sentiment_en"],
+        help="Task to train: 'mlm_en' (English MLM), 'mlm_vi' (Vietnamese MLM), or 'sentiment_vi' (Vietnamese Sentiment)."
+    )
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        required=True,
+        help="Path to the processed Hugging Face dataset directory (e.g., ./data/processed/vi_mlm/)."
+    )
+    parser.add_argument(
+        "--output_base",
+        type=str,
+        default="./adapters/",
+        help="Base directory to save trained adapters (default: ./adapters/)."
+    )
 
     args = parser.parse_args()
-    main(args)
+
+    # Example command-line calls:
+    # python train_adapter.py --task mlm_en --data_path ./data/processed/en_mlm/ --output_base ./adapters/
+    # python train_adapter.py --task mlm_vi --data_path ./data/processed/vi_mlm/ --output_base ./adapters/
+    # python train_adapter.py --task sentiment_en --data_path ./data/processed/en_sentiment/ --output_base ./adapters/
+    # import pandas as pd
+    # # Load the sentiment dataset and show the distribution of labels
+    # dataset = load_from_disk(args.data_path)    
+    # if "train" in dataset:
+    #     train_dataset = dataset["train"]
+    #     label_column = train_dataset["labels"]
+    #     label_column = pd.Series(label_column)
+    #     label_counts = label_column.value_counts()
+    #     logging.info(f"Label distribution in training set: {label_counts.to_dict()}")
+    # else:
+    #     logging.warning("No training set found in the dataset.")
+    
+
+    train_adapter(args.task, args.data_path, args.output_base)
